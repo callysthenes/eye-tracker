@@ -123,8 +123,6 @@ def init_db(db_path=DEFAULT_DB_PATH):
             c.execute(f'ALTER TABLE frame_analytics ADD COLUMN {col} {coldef}')
         except Exception:
             pass
-    ]:
-        c.execute(idx)
 
     conn.commit()
     conn.close()
