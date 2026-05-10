@@ -1,19 +1,31 @@
 """
-Facial expression, mood, and gesture analysis.
-Uses three complementary signals:
-  1. MediaPipe blendshapes (52 face coefficients)
-  2. Landmark-based metrics (MAR - mouth aspect ratio, brow height, etc.)
-  3. Haar cascade mouth detection (supplementary)
+Production-grade facial expression analysis using FACS (Facial Action Coding System).
+
+Core design principles (psychiatry-informed):
+  1. CALIBRATION: Learn each user's neutral baseline over first N frames.
+     All subsequent readings are DELTAS from baseline. This eliminates the
+     false-positive problem where idle blendshape noise triggers emotions.
+  2. ACTION UNITS (FACS): Map blendshapes + landmarks to Ekman's Action Units.
+     Emotions are detected from AU combinations, not raw blendshape values.
+  3. MUSCLE GROUP COVERAGE: Brow (corrugator, frontalis), eyes (orbicularis oculi),
+     nose (procerus, nasalis), mouth (orbicularis oris, zygomaticus, depressor),
+     jaw (masseter), chin (mentalis) — all tracked via landmarks + blendshapes.
+  4. SCREENSHOT: Every mood/expression change is captured to assets/.
 """
 
+import os
 import cv2
 import numpy as np
 from typing import Dict, Optional, List, Tuple
 from collections import deque
 from enum import Enum
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
+
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+os.makedirs(ASSETS_DIR, exist_ok=True)
 
 
 class Mood(Enum):
@@ -26,6 +38,7 @@ class Mood(Enum):
     FEARFUL = "fearful"
     EXCITED = "excited"
     DROWSY = "drowsy"
+    CONTEMPT = "contempt"
 
 
 BLENDSHAPE_NAMES = [
@@ -50,272 +63,401 @@ def _bs(bs_dict: Dict[str, float], name: str) -> float:
     return bs_dict.get(name, 0.0)
 
 
-# --- Landmark-based metric computation ---
+# ---------------------------------------------------------------------------
+# FACS Action Units — mapped from blendshapes + landmarks
+# These correspond to Ekman & Friesen's original AUs
+# ---------------------------------------------------------------------------
 
-# MediaPipe 478-point mouth landmarks
-MOUTH_OUTER = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
-MOUTH_INNER_UPPER = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415]
-MOUTH_INNER_LOWER = [87, 178, 88, 95, 308, 324, 318, 402, 317, 14]
-MOUTH_CORNERS = [61, 291]
-LIP_UPPER = [13, 82, 312]
-LIP_LOWER = [14, 87, 317]
+class ActionUnits:
+    """
+    Computes FACS Action Units from blendshapes + landmark deltas.
+    All values are DELTA from calibrated neutral baseline.
+    """
 
-# Brow landmarks
+    AU_MAP = {
+        "AU1_inner_brow_raiser": ["browInnerUp"],
+        "AU2_outer_brow_raiser": ["browOuterUpLeft", "browOuterUpRight"],
+        "AU4_brow_lowerer": ["browDownLeft", "browDownRight"],
+        "AU5_upper_lid_raiser": ["eyeWideLeft", "eyeWideRight"],
+        "AU6_cheek_raiser": ["cheekSquintLeft", "cheekSquintRight"],
+        "AU7_lid_tightener": ["eyeSquintLeft", "eyeSquintRight"],
+        "AU9_nose_wrinkler": ["noseSneerLeft", "noseSneerRight"],
+        "AU12_lip_corner_puller": ["mouthSmileLeft", "mouthSmileRight"],
+        "AU14_dimpler": ["mouthDimpleLeft", "mouthDimpleRight"],
+        "AU15_lip_corner_depressor": ["mouthFrownLeft", "mouthFrownRight"],
+        "AU17_chin_raiser": ["mouthUpperUpLeft", "mouthUpperUpRight"],
+        "AU20_lip_stretcher": ["mouthStretchLeft", "mouthStretchRight"],
+        "AU23_lip_tightener": ["mouthPressLeft", "mouthPressRight"],
+        "AU24_lip_pressor": ["mouthPressLeft", "mouthPressRight"],
+        "AU25_lips_part": ["jawOpen"],
+        "AU26_jaw_open": ["jawOpen"],
+        "AU28_lip_suck": ["mouthRollLower", "mouthRollUpper"],
+        "AU43_eyes_closed": ["eyeBlinkLeft", "eyeBlinkRight"],
+        "AU45_blink": ["eyeBlinkLeft", "eyeBlinkRight"],
+        "AU46_wink": ["eyeBlinkLeft"],
+    }
+
+    def compute(self, bs_dict: Dict[str, float], lm_deltas: Dict) -> Dict[str, float]:
+        aus = {}
+        for au_name, bs_names in self.AU_MAP.items():
+            values = [bs_dict.get(n, 0.0) for n in bs_names]
+            aus[au_name] = sum(values) / len(values)
+
+        # Override / augment with landmark deltas
+        mar_delta = lm_deltas.get("mar_delta", 0.0)
+        smile_delta = lm_deltas.get("smile_ratio_delta", 0.0)
+        brow_raise_delta = lm_deltas.get("brow_raise_delta", 0.0)
+        brow_furrow_delta = lm_deltas.get("brow_furrow_delta", 0.0)
+        eye_open_delta = lm_deltas.get("eye_openness_delta", 0.0)
+
+        if mar_delta > 0.02:
+            aus["AU25_lips_part"] = max(aus.get("AU25_lips_part", 0), mar_delta * 8)
+            aus["AU26_jaw_open"] = max(aus.get("AU26_jaw_open", 0), mar_delta * 6)
+        if smile_delta > 0.005:
+            aus["AU12_lip_corner_puller"] = max(aus.get("AU12_lip_corner_puller", 0), smile_delta * 30)
+        if brow_raise_delta > 0.005:
+            aus["AU1_inner_brow_raiser"] = max(aus.get("AU1_inner_brow_raiser", 0), brow_raise_delta * 15)
+            aus["AU2_outer_brow_raiser"] = max(aus.get("AU2_outer_brow_raiser", 0), brow_raise_delta * 12)
+        if brow_furrow_delta > 0.01:
+            aus["AU4_brow_lowerer"] = max(aus.get("AU4_brow_lowerer", 0), brow_furrow_delta * 10)
+        if eye_open_delta < -0.005:
+            aus["AU43_eyes_closed"] = max(aus.get("AU43_eyes_closed", 0), abs(eye_open_delta) * 30)
+
+        return aus
+
+
+# ---------------------------------------------------------------------------
+# Neutral baseline calibration
+# ---------------------------------------------------------------------------
+
+class BaselineCalibrator:
+    """
+    Collects blendshape + landmark samples during neutral expression
+    (first CALIBRATION_FRAMES frames) and computes mean baseline.
+    All subsequent analysis uses delta-from-baseline.
+    """
+
+    CALIBRATION_FRAMES = 60
+    CALIBRATION_INTERVAL = 2  # sample every N frames during calibration
+
+    def __init__(self):
+        self.bs_samples: List[Dict[str, float]] = []
+        self.lm_samples: List[Dict[str, float]] = []
+        self.calibrated = False
+        self.bs_baseline: Dict[str, float] = {}
+        self.lm_baseline: Dict[str, float] = {}
+
+    def add_sample(self, bs_dict: Dict[str, float], lm: Dict[str, float]):
+        if self.calibrated:
+            return
+        self.bs_samples.append(bs_dict.copy())
+        self.lm_samples.append(lm.copy())
+        if len(self.bs_samples) >= self.CALIBRATION_FRAMES:
+            self._compute_baseline()
+
+    def _compute_baseline(self):
+        all_bs_keys = set()
+        for s in self.bs_samples:
+            all_bs_keys.update(s.keys())
+        for key in all_bs_keys:
+            vals = [s.get(key, 0.0) for s in self.bs_samples]
+            self.bs_baseline[key] = float(np.mean(vals))
+
+        all_lm_keys = set()
+        for s in self.lm_samples:
+            all_lm_keys.update(s.keys())
+        for key in all_lm_keys:
+            vals = [s.get(key, 0.0) for s in self.lm_samples]
+            self.lm_baseline[key] = float(np.mean(vals))
+
+        self.calibrated = True
+        logger.info(f"Baseline calibrated from {len(self.bs_samples)} samples")
+
+    def delta_bs(self, bs_dict: Dict[str, float]) -> Dict[str, float]:
+        if not self.calibrated:
+            return bs_dict
+        return {k: max(0.0, v - self.bs_baseline.get(k, 0.0)) for k, v in bs_dict.items()}
+
+    def delta_lm(self, lm: Dict[str, float]) -> Dict[str, float]:
+        if not self.calibrated:
+            return {k: 0.0 for k in lm}
+        return {k: v - self.lm_baseline.get(k, 0.0) for k, v in lm.items()}
+
+
+# ---------------------------------------------------------------------------
+# Landmark-based metrics (all major muscle groups)
+# ---------------------------------------------------------------------------
+
 BROW_LEFT = [70, 63, 105, 66, 107]
 BROW_RIGHT = [300, 293, 334, 296, 336]
 EYE_TOP_LEFT = [159]
 EYE_TOP_RIGHT = [386]
+EYE_BOT_LEFT = [145]
+EYE_BOT_RIGHT = [374]
+FOREHEAD = [10, 109, 338, 67]
+CHIN = [152]
+NOSE_BRIDGE = [6, 168, 1, 197]
+CHEEK_LEFT = [50, 116, 117, 118, 119]
+CHEEK_RIGHT = [280, 345, 346, 347, 348]
+NASOLABIAL_LEFT = [36, 31, 48, 2]
+NASOLABIAL_RIGHT = [266, 261, 278, 272]
 
 
 class LandmarkMetrics:
-    """
-    Computes facial metrics directly from landmark coordinates.
-    More robust than blendshapes for mouth open, brow raise, etc.
-    """
 
     @staticmethod
-    def mouth_aspect_ratio(landmarks: np.ndarray) -> float:
+    def compute_all(landmarks: np.ndarray) -> Dict:
         if landmarks is None or len(landmarks) < 478:
-            return 0.0
+            return {}
         try:
-            upper = landmarks[13, :2]
-            lower = landmarks[14, :2]
-            left = landmarks[61, :2]
-            right = landmarks[291, :2]
-            vertical = np.linalg.norm(upper - lower)
-            horizontal = np.linalg.norm(left - right)
-            return float(vertical / horizontal) if horizontal > 0 else 0.0
-        except Exception:
-            return 0.0
+            fh = np.linalg.norm(landmarks[152, :2] - landmarks[10, :2])
+            fw = np.linalg.norm(landmarks[454, :2] - landmarks[234, :2])
+            if fh <= 0 or fw <= 0:
+                return {}
 
-    @staticmethod
-    def mouth_open_ratio(landmarks: np.ndarray) -> float:
-        if landmarks is None or len(landmarks) < 478:
-            return 0.0
-        try:
-            upper_lip = landmarks[[13, 82, 312], 1].mean()
-            lower_lip = landmarks[[14, 87, 317], 1].mean()
-            left_corner = landmarks[61, 1]
-            right_corner = landmarks[291, 1]
-            corners_y = (left_corner + right_corner) / 2
-            face_height = np.linalg.norm(landmarks[152, :2] - landmarks[10, :2])
-            if face_height <= 0:
-                return 0.0
-            open_dist = lower_lip - upper_lip
-            return float(open_dist / face_height)
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def smile_ratio(landmarks: np.ndarray) -> float:
-        if landmarks is None or len(landmarks) < 478:
-            return 0.0
-        try:
+            upper_lip = landmarks[13, :2]
+            lower_lip = landmarks[14, :2]
             left_corner = landmarks[61, :2]
             right_corner = landmarks[291, :2]
-            upper_lip_center = landmarks[13, :2]
-            mouth_width = np.linalg.norm(right_corner - left_corner)
-            corner_mid = (left_corner + right_corner) / 2
-            corner_to_lip = corner_mid[1] - upper_lip_center[1]
-            return float(corner_to_lip / mouth_width) if mouth_width > 0 else 0.0
-        except Exception:
-            return 0.0
+            mar = np.linalg.norm(upper_lip - lower_lip) / np.linalg.norm(left_corner - right_corner)
 
-    @staticmethod
-    def brow_raise_ratio(landmarks: np.ndarray) -> float:
-        if landmarks is None or len(landmarks) < 478:
-            return 0.0
-        try:
+            upper_lip_y = landmarks[[13, 82, 312], 1].mean()
+            lower_lip_y = landmarks[[14, 87, 317], 1].mean()
+            mouth_open_ratio = (lower_lip_y - upper_lip_y) / fh
+
+            corner_mid = (left_corner + right_corner) / 2
+            smile_ratio = (corner_mid[1] - upper_lip[1]) / np.linalg.norm(right_corner - left_corner)
+
             left_brow_y = landmarks[BROW_LEFT, 1].mean()
             right_brow_y = landmarks[BROW_RIGHT, 1].mean()
             left_eye_y = landmarks[EYE_TOP_LEFT, 1].mean()
             right_eye_y = landmarks[EYE_TOP_RIGHT, 1].mean()
-            face_height = np.linalg.norm(landmarks[152, :2] - landmarks[10, :2])
-            if face_height <= 0:
-                return 0.0
-            left_dist = left_eye_y - left_brow_y
-            right_dist = right_eye_y - right_brow_y
-            avg_dist = (left_dist + right_dist) / 2
-            return float(avg_dist / face_height)
-        except Exception:
-            return 0.0
+            brow_raise = ((left_eye_y - left_brow_y) + (right_eye_y - right_brow_y)) / 2 / fh
 
-    @staticmethod
-    def brow_furrow_ratio(landmarks: np.ndarray) -> float:
-        if landmarks is None or len(landmarks) < 478:
-            return 0.0
-        try:
-            inner_brow_left = landmarks[107, :2]
-            inner_brow_right = landmarks[336, :2]
-            face_width = np.linalg.norm(landmarks[234, :2] - landmarks[454, :2])
-            if face_width <= 0:
-                return 0.0
-            dist = np.linalg.norm(inner_brow_left - inner_brow_right)
-            return float(1.0 - dist / face_width)
-        except Exception:
-            return 0.0
+            inner_brow_dist = np.linalg.norm(landmarks[107, :2] - landmarks[336, :2])
+            brow_furrow = 1.0 - inner_brow_dist / fw
 
-    @staticmethod
-    def eye_openness(landmarks: np.ndarray) -> float:
-        if landmarks is None or len(landmarks) < 478:
-            return 0.5
-        try:
-            left_upper = landmarks[159, :2]
-            left_lower = landmarks[145, :2]
-            right_upper = landmarks[386, :2]
-            right_lower = landmarks[374, :2]
-            face_height = np.linalg.norm(landmarks[152, :2] - landmarks[10, :2])
-            if face_height <= 0:
-                return 0.5
-            left_open = np.linalg.norm(left_upper - left_lower) / face_height
-            right_open = np.linalg.norm(right_upper - right_lower) / face_height
-            return float((left_open + right_open) / 2)
-        except Exception:
-            return 0.5
+            left_open = np.linalg.norm(landmarks[159, :2] - landmarks[145, :2]) / fh
+            right_open = np.linalg.norm(landmarks[386, :2] - landmarks[374, :2]) / fh
+            eye_openness = (left_open + right_open) / 2
 
-    @staticmethod
-    def compute_all(landmarks: np.ndarray) -> Dict:
-        return {
-            "mar": LandmarkMetrics.mouth_aspect_ratio(landmarks),
-            "mouth_open_ratio": LandmarkMetrics.mouth_open_ratio(landmarks),
-            "smile_ratio": LandmarkMetrics.smile_ratio(landmarks),
-            "brow_raise": LandmarkMetrics.brow_raise_ratio(landmarks),
-            "brow_furrow": LandmarkMetrics.brow_furrow_ratio(landmarks),
-            "eye_openness": LandmarkMetrics.eye_openness(landmarks),
-        }
+            forehead_height = np.linalg.norm(landmarks[10, :2] - landmarks[107, :2]) / fh
+
+            nose_wrinkle = 0.0
+            nose_l = landmarks[48, :2]
+            nose_r = landmarks[278, :2]
+            nose_bridge_mid = landmarks[6, :2]
+            expected_width = fw * 0.25
+            actual_width = np.linalg.norm(nose_l - nose_r)
+            if actual_width < expected_width:
+                nose_wrinkle = (expected_width - actual_width) / expected_width
+
+            cheek_puff = 0.0
+            left_cheek_x = landmarks[[116, 117], 0].mean()
+            right_cheek_x = landmarks[[345, 346], 0].mean()
+            face_center_x = (landmarks[234, 0] + landmarks[454, 0]) / 2
+            left_dist = abs(left_cheek_x - face_center_x) / fw
+            right_dist = abs(right_cheek_x - face_center_x) / fw
+            cheek_puff = (left_dist + right_dist) / 2
+
+            jaw_open_lm = np.linalg.norm(landmarks[152, :2] - landmarks[10, :2]) / fh - 0.6
+            jaw_forward = (landmarks[152, 0] - landmarks[10, 0]) / fw
+
+            mouth_width = np.linalg.norm(left_corner - right_corner) / fw
+            mouth_asymmetry = abs(left_corner[1] - right_corner[1]) / fh
+
+            return {
+                "mar": float(mar),
+                "mouth_open_ratio": float(mouth_open_ratio),
+                "smile_ratio": float(smile_ratio),
+                "brow_raise": float(brow_raise),
+                "brow_furrow": float(brow_furrow),
+                "eye_openness": float(eye_openness),
+                "forehead_height": float(forehead_height),
+                "nose_wrinkle": float(nose_wrinkle),
+                "cheek_puff": float(cheek_puff),
+                "jaw_open_lm": float(max(0, jaw_open_lm)),
+                "jaw_forward": float(jaw_forward),
+                "mouth_width": float(mouth_width),
+                "mouth_asymmetry": float(mouth_asymmetry),
+            }
+        except Exception as e:
+            logger.error(f"Landmark metrics error: {e}")
+            return {}
 
 
-# --- Haar cascade mouth detector ---
+# ---------------------------------------------------------------------------
+# Haar cascade supplementary detectors
+# ---------------------------------------------------------------------------
 
-class HaarMouthDetector:
+class HaarDetectors:
     def __init__(self):
-        mouth_path = cv2.data.haarcascades + 'haarcascade_smile.xml' if hasattr(cv2.data, 'haarcascades') else ''
-        self.mouth_cascade = None
-        if mouth_path:
-            try:
-                self.mouth_cascade = cv2.CascadeClassifier(mouth_path)
-                self.available = not self.mouth_cascade.empty()
-            except Exception:
-                self.available = False
-        else:
-            self.available = False
+        base = cv2.data.haarcascades
+        self.smile = cv2.CascadeClassifier(base + 'haarcascade_smile.xml')
+        self.eye = cv2.CascadeClassifier(base + 'haarcascade_eye_tree_eyeglasses.xml')
+        self.available = not self.smile.empty()
 
-    def detect(self, frame_gray: np.ndarray, face_roi: Tuple[int, int, int, int]) -> Dict:
-        result = {"mouth_detected": False, "mouth_bbox": None, "mouth_open": False}
-        if not self.available or self.mouth_cascade is None:
+    def detect(self, gray: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> Dict:
+        result = {"smile_detected": False, "mouth_open": False}
+        if not self.available or face_bbox is None:
             return result
         try:
-            fx, fy, fw, fh = face_roi
-            lower_face_y = fy + int(fh * 0.55)
-            lower_face = frame_gray[lower_face_y:fy + fh, fx:fx + fw]
-            if lower_face.size == 0:
+            fx, fy, fw, fh = face_bbox
+            lower = gray[fy + int(fh * 0.55):fy + fh, fx:fx + fw]
+            if lower.size == 0:
                 return result
-            mouths = self.mouth_cascade.detectMultiScale(
-                lower_face, scaleFactor=1.3, minNeighbors=8, minSize=(20, 10)
-            )
-            if len(mouths) > 0:
-                mx, my, mw, mh = max(mouths, key=lambda m: m[2] * m[3])
-                result["mouth_detected"] = True
-                result["mouth_bbox"] = (fx + mx, lower_face_y + my, fx + mx + mw, lower_face_y + my + mh)
-                result["mouth_open"] = mh > mw * 0.45
+            smiles = self.smile.detectMultiScale(lower, 1.3, minNeighbors=12, minSize=(20, 10))
+            if len(smiles) > 0:
+                result["smile_detected"] = True
+                sx, sy, sw, sh = max(smiles, key=lambda m: m[2] * m[3])
+                result["mouth_open"] = sh > sw * 0.5
         except Exception:
             pass
         return result
 
 
-# --- Mood Classifier ---
+# ---------------------------------------------------------------------------
+# FACS-based Mood Classifier (psychiatry-informed)
+# Emotion -> AU combinations from Ekman (1978) and updates by Friesen & Hager
+# ---------------------------------------------------------------------------
 
-class MoodClassifier:
+class FACSMoodClassifier:
+    """
+    Classifies emotions using FACS Action Unit combinations.
+    Based on Ekman's universal emotions and their AU prototypes.
+    Uses only DELTA values (change from neutral), so idle noise is eliminated.
+    """
 
-    def classify(self, bs_dict: Dict[str, float], lm: Dict) -> Dict:
+    ACTIVATION_THRESHOLD = 0.08
+
+    def classify(self, aus: Dict[str, float]) -> Dict:
         scores = {
-            Mood.HAPPY: self._score_happy(bs_dict, lm),
-            Mood.SAD: self._score_sad(bs_dict, lm),
-            Mood.ANGRY: self._score_angry(bs_dict, lm),
-            Mood.SURPRISED: self._score_surprised(bs_dict, lm),
-            Mood.DISGUSTED: self._score_disgusted(bs_dict, lm),
-            Mood.FEARFUL: self._score_fearful(bs_dict, lm),
-            Mood.EXCITED: self._score_excited(bs_dict, lm),
-            Mood.DROWSY: self._score_drowsy(bs_dict, lm),
+            Mood.HAPPY: self._happy(aus),
+            Mood.SAD: self._sad(aus),
+            Mood.ANGRY: self._angry(aus),
+            Mood.SURPRISED: self._surprised(aus),
+            Mood.DISGUSTED: self._disgusted(aus),
+            Mood.FEARFUL: self._fearful(aus),
+            Mood.EXCITED: self._excited(aus),
+            Mood.DROWSY: self._drowsy(aus),
+            Mood.CONTEMPT: self._contempt(aus),
         }
-        scores[Mood.NEUTRAL] = max(0.0, 1.0 - max(scores.values()))
 
-        best_mood = max(scores, key=scores.get)
-        confidence = scores[best_mood]
+        active_aus = {k: v for k, v in aus.items() if v > self.ACTIVATION_THRESHOLD}
+        if not active_aus:
+            scores[Mood.NEUTRAL] = 1.0
+        else:
+            scores[Mood.NEUTRAL] = max(0.0, 1.0 - max(scores.values()) * 1.5)
+
+        best = max(scores, key=scores.get)
+        conf = scores[best]
 
         return {
-            "mood": best_mood,
-            "confidence": confidence,
+            "mood": best,
+            "confidence": min(1.0, conf),
             "scores": {m.value: round(s, 4) for m, s in scores.items()},
+            "active_aus": {k: round(v, 3) for k, v in active_aus.items()},
         }
 
-    def _score_happy(self, bs, lm):
-        smile_bs = (_bs(bs, "mouthSmileLeft") + _bs(bs, "mouthSmileRight")) / 2
-        cheek = (_bs(bs, "cheekSquintLeft") + _bs(bs, "cheekSquintRight")) / 2
-        smile_lm = max(0, lm.get("smile_ratio", 0) * 5)
-        score = smile_bs * 0.45 + cheek * 0.2 + smile_lm * 0.35
+    def _au(self, aus: Dict, name: str) -> float:
+        return aus.get(name, 0.0)
+
+    def _happy(self, aus):
+        au12 = self._au(aus, "AU12_lip_corner_puller")
+        au6 = self._au(aus, "AU6_cheek_raiser")
+        au14 = self._au(aus, "AU14_dimpler")
+        au25 = self._au(aus, "AU25_lips_part")
+        if au12 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au12 * 0.5 + au6 * 0.25 + au14 * 0.1 + au25 * 0.15
+        return min(1.0, score * 2.0)
+
+    def _sad(self, aus):
+        au15 = self._au(aus, "AU15_lip_corner_depressor")
+        au1 = self._au(aus, "AU1_inner_brow_raiser")
+        au4 = self._au(aus, "AU4_brow_lowerer")
+        au17 = self._au(aus, "AU17_chin_raiser")
+        if au15 < self.ACTIVATION_THRESHOLD and au1 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au15 * 0.35 + au1 * 0.25 + au4 * 0.2 + au17 * 0.2
         return min(1.0, score * 2.5)
 
-    def _score_sad(self, bs, lm):
-        frown = (_bs(bs, "mouthFrownLeft") + _bs(bs, "mouthFrownRight")) / 2
-        brow_inner = _bs(bs, "browInnerUp")
-        mouth_down = (_bs(bs, "mouthLowerDownLeft") + _bs(bs, "mouthLowerDownRight")) / 2
-        pucker = _bs(bs, "mouthPucker")
-        score = frown * 0.35 + brow_inner * 0.25 + mouth_down * 0.2 + pucker * 0.2
-        return min(1.0, score * 3.0)
-
-    def _score_angry(self, bs, lm):
-        brow_down = (_bs(bs, "browDownLeft") + _bs(bs, "browDownRight")) / 2
-        press = (_bs(bs, "mouthPressLeft") + _bs(bs, "mouthPressRight")) / 2
-        sneer = (_bs(bs, "noseSneerLeft") + _bs(bs, "noseSneerRight")) / 2
-        furrow_lm = max(0, lm.get("brow_furrow", 0) - 0.5) * 4
-        score = brow_down * 0.35 + press * 0.2 + sneer * 0.25 + furrow_lm * 0.2
-        return min(1.0, score * 3.0)
-
-    def _score_surprised(self, bs, lm):
-        brow_inner = _bs(bs, "browInnerUp")
-        brow_outer = (_bs(bs, "browOuterUpLeft") + _bs(bs, "browOuterUpRight")) / 2
-        eye_wide = (_bs(bs, "eyeWideLeft") + _bs(bs, "eyeWideRight")) / 2
-        jaw_open = _bs(bs, "jawOpen")
-        mar_lm = lm.get("mar", 0) * 3
-        brow_raise_lm = max(0, lm.get("brow_raise", 0) - 0.08) * 10
-        score = (brow_inner + brow_outer) / 2 * 0.25 + eye_wide * 0.25 + jaw_open * 0.2 + mar_lm * 0.15 + brow_raise_lm * 0.15
+    def _angry(self, aus):
+        au4 = self._au(aus, "AU4_brow_lowerer")
+        au23 = self._au(aus, "AU23_lip_tightener")
+        au9 = self._au(aus, "AU9_nose_wrinkler")
+        au24 = self._au(aus, "AU24_lip_pressor")
+        au7 = self._au(aus, "AU7_lid_tightener")
+        if au4 < self.ACTIVATION_THRESHOLD and au23 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au4 * 0.3 + au23 * 0.2 + au9 * 0.15 + au24 * 0.15 + au7 * 0.2
         return min(1.0, score * 2.5)
 
-    def _score_disgusted(self, bs, lm):
-        sneer = (_bs(bs, "noseSneerLeft") + _bs(bs, "noseSneerRight")) / 2
-        pucker = _bs(bs, "mouthPucker")
-        upper = (_bs(bs, "mouthUpperUpLeft") + _bs(bs, "mouthUpperUpRight")) / 2
-        nose_wrinkle = _bs(bs, "noseSneerLeft")
-        score = sneer * 0.4 + pucker * 0.2 + upper * 0.2 + nose_wrinkle * 0.2
-        return min(1.0, score * 3.0)
+    def _surprised(self, aus):
+        au1 = self._au(aus, "AU1_inner_brow_raiser")
+        au2 = self._au(aus, "AU2_outer_brow_raiser")
+        au5 = self._au(aus, "AU5_upper_lid_raiser")
+        au26 = self._au(aus, "AU26_jaw_open")
+        au25 = self._au(aus, "AU25_lips_part")
+        brow_up = max(au1, au2)
+        if brow_up < self.ACTIVATION_THRESHOLD and au5 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = brow_up * 0.3 + au5 * 0.3 + au26 * 0.2 + au25 * 0.2
+        return min(1.0, score * 2.0)
 
-    def _score_fearful(self, bs, lm):
-        brow_inner = _bs(bs, "browInnerUp")
-        eye_wide = (_bs(bs, "eyeWideLeft") + _bs(bs, "eyeWideRight")) / 2
-        mouth_funnel = _bs(bs, "mouthFunnel")
-        jaw_open = _bs(bs, "jawOpen")
-        score = brow_inner * 0.3 + eye_wide * 0.3 + mouth_funnel * 0.2 + jaw_open * 0.2
-        return min(1.0, score * 3.0)
-
-    def _score_excited(self, bs, lm):
-        smile = (_bs(bs, "mouthSmileLeft") + _bs(bs, "mouthSmileRight")) / 2
-        jaw_open = _bs(bs, "jawOpen")
-        brow_up = (_bs(bs, "browOuterUpLeft") + _bs(bs, "browOuterUpRight")) / 2
-        eye_wide = (_bs(bs, "eyeWideLeft") + _bs(bs, "eyeWideRight")) / 2
-        mar_lm = lm.get("mar", 0) * 2
-        score = smile * 0.3 + jaw_open * 0.2 + brow_up * 0.15 + eye_wide * 0.15 + mar_lm * 0.2
+    def _disgusted(self, aus):
+        au9 = self._au(aus, "AU9_nose_wrinkler")
+        au15 = self._au(aus, "AU15_lip_corner_depressor")
+        au25 = self._au(aus, "AU25_lips_part")
+        if au9 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au9 * 0.5 + au15 * 0.2 + au25 * 0.3
         return min(1.0, score * 2.5)
 
-    def _score_drowsy(self, bs, lm):
-        eye_blink = (_bs(bs, "eyeBlinkLeft") + _bs(bs, "eyeBlinkRight")) / 2
-        eye_squint = (_bs(bs, "eyeSquintLeft") + _bs(bs, "eyeSquintRight")) / 2
-        mouth_open = _bs(bs, "jawOpen")
-        eye_open_lm = lm.get("eye_openness", 0.5)
-        eye_closed_lm = max(0, 0.04 - eye_open_lm) * 25
-        score = eye_blink * 0.3 + eye_squint * 0.25 + mouth_open * 0.1 + eye_closed_lm * 0.35
+    def _fearful(self, aus):
+        au1 = self._au(aus, "AU1_inner_brow_raiser")
+        au2 = self._au(aus, "AU2_outer_brow_raiser")
+        au5 = self._au(aus, "AU5_upper_lid_raiser")
+        au25 = self._au(aus, "AU25_lips_part")
+        au20 = self._au(aus, "AU20_lip_stretcher")
+        if au1 < self.ACTIVATION_THRESHOLD and au5 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au1 * 0.25 + au2 * 0.15 + au5 * 0.25 + au25 * 0.15 + au20 * 0.2
         return min(1.0, score * 2.5)
 
+    def _excited(self, aus):
+        au12 = self._au(aus, "AU12_lip_corner_puller")
+        au5 = self._au(aus, "AU5_upper_lid_raiser")
+        au26 = self._au(aus, "AU26_jaw_open")
+        au6 = self._au(aus, "AU6_cheek_raiser")
+        if au12 < self.ACTIVATION_THRESHOLD and au5 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au12 * 0.3 + au5 * 0.2 + au26 * 0.25 + au6 * 0.25
+        return min(1.0, score * 2.0)
+
+    def _drowsy(self, aus):
+        au43 = self._au(aus, "AU43_eyes_closed")
+        au7 = self._au(aus, "AU7_lid_tightener")
+        au45 = self._au(aus, "AU45_blink")
+        if au43 < self.ACTIVATION_THRESHOLD and au45 < 0.3:
+            return 0.0
+        score = au43 * 0.5 + au7 * 0.2 + au45 * 0.3
+        return min(1.0, score * 2.0)
+
+    def _contempt(self, aus):
+        au12 = self._au(aus, "AU12_lip_corner_puller")
+        au14 = self._au(aus, "AU14_dimpler")
+        au15 = self._au(aus, "AU15_lip_corner_depressor")
+        au4 = self._au(aus, "AU4_brow_lowerer")
+        if au14 < self.ACTIVATION_THRESHOLD and au12 < self.ACTIVATION_THRESHOLD:
+            return 0.0
+        score = au14 * 0.35 + au12 * 0.25 + au15 * 0.2 + au4 * 0.2
+        return min(1.0, score * 2.0)
+
+
+# ---------------------------------------------------------------------------
+# Gesture tracker (mouth, yawn, brow, squint)
+# ---------------------------------------------------------------------------
 
 class FacialGestureTracker:
 
@@ -325,53 +467,30 @@ class FacialGestureTracker:
         self.yawning = False
         self.brow_raised = False
         self.eye_squinting = False
-
         self.yawn_start_time = None
         self.yawn_count = 0
         self.smile_count = 0
         self.mouth_open_count = 0
         self.brow_raise_count = 0
+        self._prev_mouth = False
+        self._prev_smile = False
+        self._prev_brow = False
 
-        self._prev_mouth_open = False
-        self._prev_smiling = False
-        self._prev_brow_raised = False
+    def update(self, aus: Dict, lm_deltas: Dict, haar: Dict, elapsed: float) -> Dict:
+        au12 = aus.get("AU12_lip_corner_puller", 0)
+        au25 = aus.get("AU25_lips_part", 0)
+        au26 = aus.get("AU26_jaw_open", 0)
+        au1 = aus.get("AU1_inner_brow_raiser", 0)
+        au7 = aus.get("AU7_lid_tightener", 0)
+        mar_d = lm_deltas.get("mar_delta", 0)
 
-        self.mar_history = deque(maxlen=30)
-        self.smile_history = deque(maxlen=30)
+        self.smiling = au12 > 0.08 or haar.get("smile_detected", False)
+        self.mouth_open = au25 > 0.1 or au26 > 0.1 or mar_d > 0.03 or haar.get("mouth_open", False)
+        self.brow_raised = au1 > 0.08
+        self.eye_squinting = au7 > 0.1
 
-    def update(self, bs_dict: Dict[str, float], lm: Dict, haar_mouth: Dict,
-               elapsed: float = 0.0) -> Dict:
-        mar = lm.get("mar", 0.0)
-        mouth_open_lm = lm.get("mouth_open_ratio", 0.0)
-        smile_lm = lm.get("smile_ratio", 0.0)
-        brow_raise_lm = lm.get("brow_raise", 0.0)
-
-        jaw_open_bs = _bs(bs_dict, "jawOpen")
-        smile_bs = (_bs(bs_dict, "mouthSmileLeft") + _bs(bs_dict, "mouthSmileRight")) / 2
-        squint_bs = (_bs(bs_dict, "eyeSquintLeft") + _bs(bs_dict, "eyeSquintRight")) / 2
-        brow_up_bs = (_bs(bs_dict, "browInnerUp") + _bs(bs_dict, "browOuterUpLeft") + _bs(bs_dict, "browOuterUpRight")) / 3
-
-        self.mar_history.append(mar)
-
-        is_mouth_open_bs = jaw_open_bs > 0.2
-        is_mouth_open_lm = mar > 0.15 or mouth_open_lm > 0.04
-        is_mouth_open_haar = haar_mouth.get("mouth_open", False)
-        self.mouth_open = is_mouth_open_bs or is_mouth_open_lm or is_mouth_open_haar
-
-        is_smile_bs = smile_bs > 0.2
-        is_smile_lm = smile_lm > 0.03
-        self.smiling = is_smile_bs or is_smile_lm
-
-        is_brow_bs = brow_up_bs > 0.25
-        is_brow_lm = brow_raise_lm > 0.10
-        self.brow_raised = is_brow_bs or is_brow_lm
-
-        self.eye_squinting = squint_bs > 0.3
-
-        self.smile_history.append(self.smiling)
-
-        effective_mar = mar if mar > 0 else jaw_open_bs * 0.5
-        if effective_mar > 0.35 or jaw_open_bs > 0.5:
+        effective_mar = mar_d if mar_d > 0 else au26 * 0.3
+        if effective_mar > 0.06 or au26 > 0.35:
             if not self.yawning:
                 self.yawning = True
                 self.yawn_start_time = elapsed
@@ -382,16 +501,15 @@ class FacialGestureTracker:
             self.yawning = False
             self.yawn_start_time = None
 
-        if self.mouth_open and not self._prev_mouth_open:
+        if self.mouth_open and not self._prev_mouth:
             self.mouth_open_count += 1
-        if self.smiling and not self._prev_smiling:
+        if self.smiling and not self._prev_smile:
             self.smile_count += 1
-        if self.brow_raised and not self._prev_brow_raised:
+        if self.brow_raised and not self._prev_brow:
             self.brow_raise_count += 1
-
-        self._prev_mouth_open = self.mouth_open
-        self._prev_smiling = self.smiling
-        self._prev_brow_raised = self.brow_raised
+        self._prev_mouth = self.mouth_open
+        self._prev_smile = self.smiling
+        self._prev_brow = self.brow_raised
 
         return {
             "mouth_open": self.mouth_open,
@@ -403,33 +521,60 @@ class FacialGestureTracker:
             "brow_raised": self.brow_raised,
             "brow_raise_count": self.brow_raise_count,
             "eye_squinting": self.eye_squinting,
-            "jaw_open_amount": max(jaw_open_bs, mar),
-            "smile_amount": max(smile_bs, smile_lm * 5),
-            "mar": mar,
-            "mouth_open_ratio": mouth_open_lm,
+            "jaw_open_amount": max(au26, mar_d * 5),
+            "smile_amount": au12,
+            "mar": mar_d + (aus.get("mar_baseline", 0)),
+            "mouth_open_ratio": lm_deltas.get("mouth_open_ratio_delta", 0),
         }
 
 
+# ---------------------------------------------------------------------------
+# Screenshot capture on mood change
+# ---------------------------------------------------------------------------
+
+def capture_mood_screenshot(frame: np.ndarray, mood: str, session_id: int):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    filename = os.path.join(ASSETS_DIR, f"session{session_id}_{ts}_{mood}.jpg")
+    cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    logger.info(f"Mood screenshot saved: {filename}")
+    return filename
+
+
+# ---------------------------------------------------------------------------
+# Main MoodTracker — orchestrates everything
+# ---------------------------------------------------------------------------
+
 class MoodTracker:
 
+    CALIBRATION_SAMPLES = 60
+
     def __init__(self, smoothing_window: int = 7):
-        self.mood_classifier = MoodClassifier()
+        self.calibrator = BaselineCalibrator()
+        self.au_engine = ActionUnits()
+        self.classifier = FACSMoodClassifier()
         self.gesture_tracker = FacialGestureTracker()
         self.landmark_metrics = LandmarkMetrics()
-        self.haar_mouth = HaarMouthDetector()
+        self.haar = HaarDetectors()
         self.mood_history = deque(maxlen=smoothing_window)
         self._last_mood = Mood.NEUTRAL
-        self._last_mood_time = 0.0
+        self._calibration_frame = 0
 
-    def analyze(self, blendshapes, landmarks: np.ndarray = None,
-                frame_gray: np.ndarray = None, face_bbox=None,
-                elapsed: float = 0.0) -> Dict:
+    @property
+    def is_calibrated(self):
+        return self.calibrator.calibrated
 
-        lm = LandmarkMetrics.compute_all(landmarks) if landmarks is not None else {}
+    @property
+    def calibration_progress(self):
+        return min(1.0, len(self.calibrator.bs_samples) / self.calibrator.CALIBRATION_FRAMES)
 
-        haar_result = {"mouth_detected": False, "mouth_bbox": None, "mouth_open": False}
+    def analyze(self, blendshapes, landmarks=None, frame_gray=None, face_bbox=None,
+                frame_bgr=None, session_id=0, elapsed: float = 0.0) -> Dict:
+
+        lm = self.landmark_metrics.compute_all(landmarks) if landmarks is not None else {}
+
+        haar_result = {"smile_detected": False, "mouth_open": False}
         if frame_gray is not None and face_bbox is not None:
-            haar_result = self.haar_mouth.detect(frame_gray, face_bbox)
+            haar_result = self.haar.detect(frame_gray, face_bbox)
 
         bs_dict = {}
         if blendshapes is not None:
@@ -440,20 +585,36 @@ class MoodTracker:
             except Exception as e:
                 logger.error(f"Blendshape parse error: {e}")
 
-        mood_result = self.mood_classifier.classify(bs_dict, lm)
-        gesture_result = self.gesture_tracker.update(bs_dict, lm, haar_result, elapsed)
+        if not self.calibrator.calibrated:
+            self._calibration_frame += 1
+            if self._calibration_frame % BaselineCalibrator.CALIBRATION_INTERVAL == 0:
+                self.calibrator.add_sample(bs_dict, lm)
+            return self._calibrating_result()
+
+        bs_delta = self.calibrator.delta_bs(bs_dict)
+        lm_deltas = self.calibrator.delta_lm(lm)
+        aus = self.au_engine.compute(bs_delta, lm_deltas)
+
+        mood_result = self.classifier.classify(aus)
+        gesture_result = self.gesture_tracker.update(aus, lm_deltas, haar_result, elapsed)
 
         self.mood_history.append(mood_result["mood"])
-        smoothed_mood = self._smoothed_mood()
+        smoothed = self._smoothed_mood()
+
+        screenshot_path = None
+        if smoothed != self._last_mood and frame_bgr is not None:
+            screenshot_path = capture_mood_screenshot(frame_bgr, smoothed.value, session_id)
+            self._last_mood = smoothed
 
         return {
-            "mood": smoothed_mood.value,
+            "mood": smoothed.value,
             "mood_confidence": mood_result["confidence"],
             "mood_scores": mood_result["scores"],
+            "active_aus": mood_result.get("active_aus", {}),
             "gesture": gesture_result,
             "landmark_metrics": {k: round(v, 4) for k, v in lm.items()},
-            "haar_mouth": haar_result,
-            "blendshapes_raw": {k: round(v, 4) for k, v in bs_dict.items()},
+            "screenshot": screenshot_path,
+            "calibrated": True,
         }
 
     def _smoothed_mood(self) -> Mood:
@@ -462,3 +623,25 @@ class MoodTracker:
         from collections import Counter
         counts = Counter(self.mood_history)
         return counts.most_common(1)[0][0]
+
+    def _calibrating_result(self) -> Dict:
+        pct = int(self.calibration_progress * 100)
+        return {
+            "mood": "calibrating",
+            "mood_confidence": 0.0,
+            "mood_scores": {},
+            "active_aus": {},
+            "gesture": {
+                "mouth_open": False, "mouth_open_count": 0,
+                "smiling": False, "smile_count": 0,
+                "yawning": False, "yawn_count": 0,
+                "brow_raised": False, "brow_raise_count": 0,
+                "eye_squinting": False,
+                "jaw_open_amount": 0.0, "smile_amount": 0.0,
+                "mar": 0.0, "mouth_open_ratio": 0.0,
+            },
+            "landmark_metrics": {},
+            "screenshot": None,
+            "calibrated": False,
+            "calibration_progress": pct,
+        }

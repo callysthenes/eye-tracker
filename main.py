@@ -109,6 +109,7 @@ class TrackingThread(QThread):
                 mood_data = self.mood_tracker.analyze(
                     blendshapes, landmarks=landmarks,
                     frame_gray=gray_frame, face_bbox=face_bbox,
+                    frame_bgr=frame, session_id=self.session_id or 0,
                     elapsed=elapsed
                 )
 
@@ -306,11 +307,18 @@ class TrackingThread(QThread):
             'happy': (0, 255, 0), 'sad': (255, 100, 100), 'angry': (0, 0, 255),
             'surprised': (0, 255, 255), 'neutral': (200, 200, 200),
             'excited': (0, 200, 255), 'disgusted': (0, 150, 255), 'fearful': (180, 0, 255),
-            'drowsy': (100, 100, 255),
+            'drowsy': (100, 100, 255), 'contempt': (180, 180, 0),
+            'calibrating': (255, 255, 0),
         }
         mc = mood_color_map.get(mood, (200, 200, 200))
-        cv2.putText(frame_copy, f"Mood: {mood.upper()} ({mood_conf:.0%})", (10, 117),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, mc, 2)
+
+        if mood == 'calibrating':
+            pct = mood_data.get('calibration_progress', 0)
+            cv2.putText(frame_copy, f"CALIBRATING... {pct}%", (10, 117),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, mc, 2)
+        else:
+            cv2.putText(frame_copy, f"Mood: {mood.upper()} ({mood_conf:.0%})", (10, 117),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, mc, 2)
 
         gesture = mood_data.get('gesture', {})
         mar = gesture.get('mar', 0.0)
