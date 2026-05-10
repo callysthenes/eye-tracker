@@ -583,11 +583,14 @@ class MoodTracker:
         bs_dict = {}
         if blendshapes is not None:
             try:
-                for i, bs in enumerate(blendshapes):
-                    name = BLENDSHAPE_NAMES[i] if i < len(BLENDSHAPE_NAMES) else f"unknown_{i}"
+                cats = blendshapes.categories if hasattr(blendshapes, 'categories') else blendshapes
+                for i, bs in enumerate(cats):
+                    name = bs.category_name if hasattr(bs, 'category_name') else BLENDSHAPE_NAMES[i] if i < len(BLENDSHAPE_NAMES) else f"unknown_{i}"
                     bs_dict[name] = bs.score
             except Exception as e:
                 logger.error(f"Blendshape parse error: {e}")
+            if bs_dict:
+                logger.debug(f"Parsed {len(bs_dict)} blendshapes, tongueOut={bs_dict.get('tongueOut', 0):.3f}")
 
         if not self.calibrator.calibrated:
             self._calibration_frame += 1
