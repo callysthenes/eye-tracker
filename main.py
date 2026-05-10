@@ -259,88 +259,148 @@ class TrackingThread(QThread):
 
     def _draw_debug_overlay(self, frame, detections, blink_data, gaze_data, mood_data):
         frame_copy = frame.copy()
+        landmarks = detections.get('landmarks')
 
-        method = detections.get('detection_method', 'none')
+        if landmarks is not None and len(landmarks) >= 478:
+            self._draw_face_skeleton(frame_copy, landmarks)
 
         for face in detections.get('faces', []):
             x1, y1, x2, y2 = face['bbox']
             cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame_copy, f"Face: {face['conf']:.2f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        for eye in detections.get('eyes', []):
-            x1, y1, x2, y2 = eye['bbox']
-            cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (255, 200, 0), 1)
-
-        landmarks = detections.get('landmarks')
-        if landmarks is not None and len(landmarks) >= 478:
-            left_eye_pts = landmarks[[33, 133, 159, 145], :2].astype(int)
-            right_eye_pts = landmarks[[263, 362, 386, 374], :2].astype(int)
-            for pt in left_eye_pts:
-                cv2.circle(frame_copy, tuple(pt), 2, (0, 255, 255), -1)
-            for pt in right_eye_pts:
-                cv2.circle(frame_copy, tuple(pt), 2, (0, 255, 255), -1)
-            mouth_pts = landmarks[[13, 14, 61, 291, 78, 308], :2].astype(int)
-            for pt in mouth_pts:
-                cv2.circle(frame_copy, tuple(pt), 2, (0, 200, 255), -1)
-
-        cv2.putText(frame_copy, f"Detect: {method}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        method = detections.get('detection_method', 'none')
+        cv2.putText(frame_copy, f"Detect: {method}", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
         ear = blink_data.get('avg_ear', 0.0)
         color = (0, 255, 0) if ear > 0.2 else (0, 0, 255)
-        cv2.putText(frame_copy, f"EAR: {ear:.2f}", (10, 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.putText(frame_copy, f"EAR: {ear:.2f}", (10, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         bpm = blink_data.get('blinks_per_minute', 0.0)
-        cv2.putText(frame_copy, f"Blinks/min: {bpm:.1f}", (10, 71),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        cv2.putText(frame_copy, f"BPM: {bpm:.1f}", (10, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
         on_screen = gaze_data.get('is_on_screen', True)
-        gaze_color = (0, 255, 0) if on_screen else (0, 0, 255)
-        cv2.putText(frame_copy, "ON SCREEN" if on_screen else "OFF SCREEN", (10, 94),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, gaze_color, 2)
+        gc = (0, 255, 0) if on_screen else (0, 0, 255)
+        cv2.putText(frame_copy, "ON SCREEN" if on_screen else "OFF SCREEN", (10, 82),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, gc, 2)
 
         mood = mood_data.get('mood', 'neutral')
         mood_conf = mood_data.get('mood_confidence', 0.0)
-        mood_color_map = {
+        mcm = {
             'happy': (0, 255, 0), 'sad': (255, 100, 100), 'angry': (0, 0, 255),
             'surprised': (0, 255, 255), 'neutral': (200, 200, 200),
             'excited': (0, 200, 255), 'disgusted': (0, 150, 255), 'fearful': (180, 0, 255),
             'drowsy': (100, 100, 255), 'contempt': (180, 180, 0),
             'calibrating': (255, 255, 0),
         }
-        mc = mood_color_map.get(mood, (200, 200, 200))
-
+        mc = mcm.get(mood, (200, 200, 200))
         if mood == 'calibrating':
             pct = mood_data.get('calibration_progress', 0)
-            cv2.putText(frame_copy, f"CALIBRATING... {pct}%", (10, 117),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, mc, 2)
+            cv2.putText(frame_copy, f"CALIBRATING {pct}%", (10, 102),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, mc, 2)
         else:
-            cv2.putText(frame_copy, f"Mood: {mood.upper()} ({mood_conf:.0%})", (10, 117),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, mc, 2)
+            cv2.putText(frame_copy, f"{mood.upper()} ({mood_conf:.0%})", (10, 102),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, mc, 2)
 
         gesture = mood_data.get('gesture', {})
         mar = gesture.get('mar', 0.0)
-        cv2.putText(frame_copy, f"MAR: {mar:.3f}", (10, 140),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        jaw = gesture.get('jaw_open_amount', 0.0)
+        smile = gesture.get('smile_amount', 0.0)
+        cv2.putText(frame_copy, f"MAR:{mar:.2f} JAW:{jaw:.2f} SMILE:{smile:.2f}", (10, 122),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
 
-        gestures_active = []
-        if gesture.get('smiling'):
-            gestures_active.append("SMILE")
-        if gesture.get('mouth_open'):
-            gestures_active.append("MOUTH OPEN")
-        if gesture.get('yawning'):
-            gestures_active.append("YAWN")
-        if gesture.get('brow_raised'):
-            gestures_active.append("BROW UP")
-        if gesture.get('eye_squinting'):
-            gestures_active.append("SQUINT")
-        if gestures_active:
-            cv2.putText(frame_copy, " | ".join(gestures_active), (10, 163),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+        tags = []
+        if gesture.get('smiling'): tags.append("SMILE")
+        if gesture.get('mouth_open'): tags.append("MOUTH")
+        if gesture.get('yawning'): tags.append("YAWN")
+        if gesture.get('brow_raised'): tags.append("BROW")
+        if gesture.get('eye_squinting'): tags.append("SQUINT")
+        if gesture.get('tongue_out'): tags.append("TONGUE")
+        if tags:
+            cv2.putText(frame_copy, " | ".join(tags), (10, 140),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 2)
 
         return frame_copy
+
+    @staticmethod
+    def _draw_face_skeleton(frame, lm):
+        GREEN = (0, 255, 0)
+        CYAN = (255, 255, 0)
+        YELLOW = (0, 255, 255)
+        MAGENTA = (255, 0, 255)
+        ORANGE = (0, 165, 255)
+        BLUE = (255, 100, 100)
+        WHITE = (255, 255, 255)
+        RED = (0, 0, 255)
+
+        def pts(indices):
+            return [tuple(lm[i, :2].astype(int)) for i in indices]
+
+        def polyline(indices, color, thickness=1):
+            points = pts(indices)
+            for i in range(len(points) - 1):
+                cv2.line(frame, points[i], points[i + 1], color, thickness)
+
+        def dots(indices, color, radius=2):
+            for p in pts(indices):
+                cv2.circle(frame, p, radius, color, -1)
+
+        # Left eyebrow (green)
+        polyline([70, 63, 105, 66, 107], GREEN, 2)
+        dots([70, 63, 105, 66, 107], GREEN, 3)
+        # Right eyebrow
+        polyline([300, 293, 334, 296, 336], GREEN, 2)
+        dots([300, 293, 334, 296, 336], GREEN, 3)
+
+        # Left eye contour (cyan)
+        polyline([33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7, 33], CYAN, 1)
+        dots([159, 145], CYAN, 3)  # top/bottom
+        # Right eye contour
+        polyline([263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 373, 390, 249, 263], CYAN, 1)
+        dots([386, 374], CYAN, 3)
+
+        # Left iris (yellow)
+        dots([468, 469, 470, 471, 472], YELLOW, 2)
+        # Right iris
+        dots([473, 474, 475, 476, 477], YELLOW, 2)
+
+        # Nose bridge + bottom (magenta)
+        polyline([168, 6, 197, 195, 5, 4, 1, 19, 94, 2], MAGENTA, 1)
+        dots([6, 1, 4, 5, 197, 195], MAGENTA, 2)
+
+        # Outer mouth (orange)
+        outer_mouth = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
+                       409, 270, 269, 267, 0, 37, 39, 40, 185, 61]
+        polyline(outer_mouth, ORANGE, 2)
+        dots([61, 291], ORANGE, 3)  # corners
+
+        # Inner mouth / lips (blue)
+        inner_upper = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95, 78]
+        polyline(inner_upper, BLUE, 1)
+        dots([13, 14], RED, 3)  # upper/lower lip center
+
+        # Face oval (white, thin)
+        face_oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+                     397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+                     172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10]
+        polyline(face_oval, (80, 80, 80), 1)
+
+        # Forehead line (white)
+        polyline([10, 109, 67, 103, 54, 21, 162], (120, 120, 120), 1)
+        polyline([10, 338, 297, 332, 284], (120, 120, 120), 1)
+
+        # Chin
+        dots([152], WHITE, 3)
+        polyline([377, 152, 148], (120, 120, 120), 1)
+
+        # Cheekbones
+        dots([116, 117, 118, 345, 346, 347], (180, 130, 50), 2)
+
+        # Tongue
+        if len(lm) > 478:
+            dots([478, 479, 480, 481, 482, 483, 484, 485, 486, 487], RED, 2)
 
     def _cleanup(self):
         if self.session_id:

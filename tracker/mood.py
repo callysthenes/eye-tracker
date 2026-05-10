@@ -476,21 +476,24 @@ class FacialGestureTracker:
         self._prev_smile = False
         self._prev_brow = False
 
-    def update(self, aus: Dict, lm_deltas: Dict, haar: Dict, elapsed: float) -> Dict:
+    def update(self, aus: Dict, lm_raw: Dict, lm_deltas: Dict, haar: Dict, elapsed: float, bs_raw: Dict) -> Dict:
         au12 = aus.get("AU12_lip_corner_puller", 0)
         au25 = aus.get("AU25_lips_part", 0)
         au26 = aus.get("AU26_jaw_open", 0)
         au1 = aus.get("AU1_inner_brow_raiser", 0)
         au7 = aus.get("AU7_lid_tightener", 0)
-        mar_d = lm_deltas.get("mar_delta", 0)
+        mar_raw = lm_raw.get("mar", 0.0)
+        mar_d = lm_deltas.get("mar_delta", 0.0)
+        jaw_open_bs = bs_raw.get("jawOpen", 0.0)
+        smile_bs = (bs_raw.get("mouthSmileLeft", 0.0) + bs_raw.get("mouthSmileRight", 0.0)) / 2
+        tongue_bs = bs_raw.get("tongueOut", 0.0)
 
-        self.smiling = au12 > 0.08 or haar.get("smile_detected", False)
-        self.mouth_open = au25 > 0.1 or au26 > 0.1 or mar_d > 0.03 or haar.get("mouth_open", False)
-        self.brow_raised = au1 > 0.08
-        self.eye_squinting = au7 > 0.1
+        self.smiling = au12 > 0.06 or smile_bs > 0.2 or haar.get("smile_detected", False)
+        self.mouth_open = au25 > 0.06 or au26 > 0.06 or mar_raw > 0.15 or jaw_open_bs > 0.15 or haar.get("mouth_open", False)
+        self.brow_raised = au1 > 0.06
+        self.eye_squinting = au7 > 0.08
 
-        effective_mar = mar_d if mar_d > 0 else au26 * 0.3
-        if effective_mar > 0.06 or au26 > 0.35:
+        if self.mouth_open and (mar_raw > 0.3 or jaw_open_bs > 0.4):
             if not self.yawning:
                 self.yawning = True
                 self.yawn_start_time = elapsed
@@ -521,10 +524,11 @@ class FacialGestureTracker:
             "brow_raised": self.brow_raised,
             "brow_raise_count": self.brow_raise_count,
             "eye_squinting": self.eye_squinting,
-            "jaw_open_amount": max(au26, mar_d * 5),
-            "smile_amount": au12,
-            "mar": mar_d + (aus.get("mar_baseline", 0)),
-            "mouth_open_ratio": lm_deltas.get("mouth_open_ratio_delta", 0),
+            "tongue_out": tongue_bs > 0.15,
+            "jaw_open_amount": jaw_open_bs,
+            "smile_amount": smile_bs,
+            "mar": mar_raw,
+            "mouth_open_ratio": lm_raw.get("mouth_open_ratio", 0.0),
         }
 
 
@@ -596,7 +600,7 @@ class MoodTracker:
         aus = self.au_engine.compute(bs_delta, lm_deltas)
 
         mood_result = self.classifier.classify(aus)
-        gesture_result = self.gesture_tracker.update(aus, lm_deltas, haar_result, elapsed)
+        gesture_result = self.gesture_tracker.update(aus, lm, lm_deltas, haar_result, elapsed, bs_dict)
 
         self.mood_history.append(mood_result["mood"])
         smoothed = self._smoothed_mood()
