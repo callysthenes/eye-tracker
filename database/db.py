@@ -67,6 +67,8 @@ def init_db(db_path=DEFAULT_DB_PATH):
             is_yawning INTEGER,
             is_brow_raised INTEGER,
             is_eye_squinting INTEGER,
+            mar REAL,
+            mouth_open_ratio REAL,
             detection_method TEXT,
             FOREIGN KEY(session_id) REFERENCES session(id)
         )
@@ -113,6 +115,14 @@ def init_db(db_path=DEFAULT_DB_PATH):
         'CREATE INDEX IF NOT EXISTS idx_gesture_session ON gesture_events(session_id)',
         'CREATE INDEX IF NOT EXISTS idx_blink_session ON blink_events(session_id)',
         'CREATE INDEX IF NOT EXISTS idx_event_session ON event(session_id)',
+    ]:
+        c.execute(idx)
+
+    for col, coldef in [('mar', 'REAL'), ('mouth_open_ratio', 'REAL')]:
+        try:
+            c.execute(f'ALTER TABLE frame_analytics ADD COLUMN {col} {coldef}')
+        except Exception:
+            pass
     ]:
         c.execute(idx)
 
@@ -191,8 +201,8 @@ class DatabaseHandler:
                     mood, mood_confidence,
                     mouth_open_amount, smile_amount, jaw_open_amount, brow_raise_amount,
                     is_mouth_open, is_smiling, is_yawning, is_brow_raised, is_eye_squinting,
-                    detection_method
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mar, mouth_open_ratio, detection_method
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 session_id,
                 datetime.now().isoformat(),
@@ -216,6 +226,8 @@ class DatabaseHandler:
                 1 if frame_data.get('is_yawning', False) else 0,
                 1 if frame_data.get('is_brow_raised', False) else 0,
                 1 if frame_data.get('is_eye_squinting', False) else 0,
+                frame_data.get('mar', 0.0),
+                frame_data.get('mouth_open_ratio', 0.0),
                 frame_data.get('detection_method', 'none'),
             ))
             conn.commit()

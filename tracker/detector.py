@@ -351,6 +351,8 @@ class DetectionPipeline:
             'face_rois': [],
             'eye_rois': {'left': None, 'right': None},
             'frame': frame,
+            'gray_frame': cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+            'face_bbox': None,
             'detection_method': 'none'
         }
         
@@ -370,6 +372,7 @@ class DetectionPipeline:
                         'conf': mp_result['face_conf'],
                         'cls': 0
                     })
+                    detections['face_bbox'] = mp_result['face_bbox']
                 
                 detections['face_rois'] = self._extract_face_rois(frame, detections['faces'])
                 detections['eye_rois'] = self._extract_eye_rois(frame, landmarks)

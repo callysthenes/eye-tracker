@@ -101,10 +101,16 @@ class TrackingThread(QThread):
                 detections = self.detection_pipeline.process_frame(frame)
                 landmarks = detections.get('landmarks')
                 blendshapes = detections.get('blendshapes')
+                gray_frame = detections.get('gray_frame')
+                face_bbox = detections.get('face_bbox')
 
                 blink_data = self.blink_detector.detect(landmarks, frame_idx=self.frame_count)
                 gaze_data = self.gaze_estimator.estimate_gaze_direction(landmarks)
-                mood_data = self.mood_tracker.analyze(blendshapes, elapsed)
+                mood_data = self.mood_tracker.analyze(
+                    blendshapes, landmarks=landmarks,
+                    frame_gray=gray_frame, face_bbox=face_bbox,
+                    elapsed=elapsed
+                )
 
                 off_screen_result = self.off_screen_tracker.update(
                     not gaze_data.get('is_on_screen', True),
@@ -244,6 +250,8 @@ class TrackingThread(QThread):
             'is_yawning': gesture.get('yawning', False),
             'is_brow_raised': gesture.get('brow_raised', False),
             'is_eye_squinting': gesture.get('eye_squinting', False),
+            'mar': gesture.get('mar', 0.0),
+            'mouth_open_ratio': gesture.get('mouth_open_ratio', 0.0),
             'detection_method': detections.get('detection_method', 'none'),
         }
         self.db_handler.log_frame(self.session_id, frame_data)
@@ -271,6 +279,9 @@ class TrackingThread(QThread):
                 cv2.circle(frame_copy, tuple(pt), 2, (0, 255, 255), -1)
             for pt in right_eye_pts:
                 cv2.circle(frame_copy, tuple(pt), 2, (0, 255, 255), -1)
+            mouth_pts = landmarks[[13, 14, 61, 291, 78, 308], :2].astype(int)
+            for pt in mouth_pts:
+                cv2.circle(frame_copy, tuple(pt), 2, (0, 200, 255), -1)
 
         cv2.putText(frame_copy, f"Detect: {method}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
@@ -286,8 +297,7 @@ class TrackingThread(QThread):
 
         on_screen = gaze_data.get('is_on_screen', True)
         gaze_color = (0, 255, 0) if on_screen else (0, 0, 255)
-        gaze_text = "ON SCREEN" if on_screen else "OFF SCREEN"
-        cv2.putText(frame_copy, gaze_text, (10, 94),
+        cv2.putText(frame_copy, "ON SCREEN" if on_screen else "OFF SCREEN", (10, 94),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, gaze_color, 2)
 
         mood = mood_data.get('mood', 'neutral')
@@ -296,25 +306,30 @@ class TrackingThread(QThread):
             'happy': (0, 255, 0), 'sad': (255, 100, 100), 'angry': (0, 0, 255),
             'surprised': (0, 255, 255), 'neutral': (200, 200, 200),
             'excited': (0, 200, 255), 'disgusted': (0, 150, 255), 'fearful': (180, 0, 255),
+            'drowsy': (100, 100, 255),
         }
         mc = mood_color_map.get(mood, (200, 200, 200))
         cv2.putText(frame_copy, f"Mood: {mood.upper()} ({mood_conf:.0%})", (10, 117),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, mc, 2)
 
         gesture = mood_data.get('gesture', {})
+        mar = gesture.get('mar', 0.0)
+        cv2.putText(frame_copy, f"MAR: {mar:.3f}", (10, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+
         gestures_active = []
         if gesture.get('smiling'):
             gestures_active.append("SMILE")
         if gesture.get('mouth_open'):
-            gestures_active.append("MOUTH")
+            gestures_active.append("MOUTH OPEN")
         if gesture.get('yawning'):
             gestures_active.append("YAWN")
         if gesture.get('brow_raised'):
-            gestures_active.append("BROW")
+            gestures_active.append("BROW UP")
         if gesture.get('eye_squinting'):
             gestures_active.append("SQUINT")
         if gestures_active:
-            cv2.putText(frame_copy, " | ".join(gestures_active), (10, 140),
+            cv2.putText(frame_copy, " | ".join(gestures_active), (10, 163),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
 
         return frame_copy
